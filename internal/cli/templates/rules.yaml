@@ -1,0 +1,50 @@
+version: 1
+
+# 上から順に評価し、最初にマッチしたルールだけが実行される。
+# match.* のパターン:  *  は "/" 以外の任意、 **  は "/" を含む任意、 ?  は 1 文字。
+# 大文字小文字は区別しない。exclude_* は対応する許可リストより常に優先される。
+
+rules:
+  - name: review-requested
+    enabled: true
+    on: [review_requested]
+    match:
+      # 空にすると全リポジトリが対象。`YasushiKobayashi/*` のように絞れる
+      repos: []
+      exclude_repos: []
+      authors: []
+      # bot の PR まで毎回レビューさせるとトークンが溶けるので既定で外す
+      exclude_authors: ["*[bot]"]
+      labels: []
+      exclude_labels: ["wip", "do-not-review"]
+      include_draft: false
+    action:
+      # Go の text/template。{{.Repo}} {{.PRNumber}} {{.PRTitle}} {{.PRURL}}
+      # {{.Author}} {{.HeadRefName}} {{.HeadSHA}} {{.BaseRefName}} {{.Labels}} が使える。
+      prompt: |
+        あなたはこの pull request のレビュアーです。
+
+        - 対象: {{.Repo}}#{{.PRNumber}} 「{{.PRTitle}}」
+        - 差分: `git diff origin/{{.BaseRefName}}...HEAD`
+
+        次の形式の Markdown だけを出力してください。
+
+        ## 指摘
+        - `path/to/file.ts:42` — 何が問題か（1 行）／なぜ問題か（1 行）
+
+        制約:
+        - 重大度が高いものだけ。スタイルや nit は書かない
+        - 憶測ではなく、差分と周辺コードから確認できることだけ書く
+        - 指摘が無ければ「指摘なし」とだけ出力する
+      # config.yaml の claude.mode を上書きする（headless / ghostty）。
+      # 省略すると config.yaml の既定に従う
+      # mode: ghostty
+      # 指定すると reviewd は worktree を用意せず、このディレクトリで claude を起動する。
+      # Claude Code の local スコープ MCP と .mcp.json の承認は「起動したディレクトリ」に
+      # 紐づくため、毎回新しい worktree パスだとそれらが失われる。既存 clone で起動して
+      # 隔離はプロンプト側で worktree を作らせて担保したいときに使う（README 参照）
+      # workdir: ~/go/src/github.com/owner/repo
+      timeout: 20m
+      notify: true
+      # true にすると実行後も worktree を残す（デバッグ用）
+      keep_worktree: false

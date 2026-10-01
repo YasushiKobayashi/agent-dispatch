@@ -1,0 +1,66 @@
+schema: spec-driven
+
+context: |
+  プロジェクト: reviewd。Mac にローカル常駐し、GitHub のレビュー依頼を検知して
+  git worktree 上で Claude Code を起動する単一バイナリの CLI（Go / cobra）。
+  GitHub Actions ではなく「ローカル PC で起動する」ことが要件の中核。
+
+  構成（単一 Go リポジトリ。module github.com/YasushiKobayashi/agent-dispatch、go 1.27）:
+  - cmd/reviewd/     : エントリポイント（cobra）
+  - internal/cli/    : サブコマンド定義（poll / seed / run / status / rules / init / daemon）
+  - internal/app/    : source → store → rule → worktree → runner → notify の配線
+  - internal/config/ : config.yaml / rules.yaml のロードと検証
+  - internal/source/github/ : gh CLI ラッパ（レビュー依頼の取得）
+  - internal/store/  : SQLite による処理済みカーソル管理（冪等性）
+  - internal/rule/   : イベント → アクションのマッチング（internal/glob 併用）
+  - internal/worktree/ : bare mirror clone + git worktree の用意と掃除
+  - internal/runner/ : claude 実行（timeout / 同時実行数上限 / ログ保存）
+  - internal/notify/ : macOS 通知（terminal-notifier / osascript）
+  - internal/ghostty/: Ghostty のタブ生成（AppleScript 経由。対話 claude の起動先）
+  - internal/daemon/ : launchd plist 生成と install / uninstall
+  - internal/{execx,lockfile,model,glob}/ : 実行ラッパ / flock / ドメイン型 / パターン照合
+  - doc/             : 設計・運用ドキュメント
+
+  外部依存（すべてローカルの実行ファイル）:
+  - gh CLI     : GitHub 認証と検索を丸ごと委譲する。reviewd は token を持たない
+  - claude CLI : レビュー本体。headless (`claude -p`) と ghostty（Ghostty タブで対話起動）の 2 モード
+  - launchd    : 定期実行。plist は install 時に PATH を焼き込んで生成する
+  - SQLite     : modernc.org/sqlite（pure Go。cgo 不要を維持すること）
+
+  規約:
+  - lint / test は `make pre-commit`（gofmt + go vet + go test ./...）。commit 前に通す
+  - 設計の SSOT は doc/design.md。導入手順は README.md
+  - 外部コマンドは internal/execx の Runner interface 経由で呼び、テストから差し替える
+  - 副作用の既定は「読み取り専用」。PR への自動コメント投稿など外向きの副作用は入れない
+
+  ドキュメント運用ルール:
+  - OpenSpec と doc の使い分け: doc/development/openspec.md
+  - doc/ = システムの現在の期待仕様（結果。事実は常にコード側）
+  - openspec/ = 変更(Change)単位の背景・検討・意思決定（Working Document・過程）
+
+  ライフサイクル:
+  - フロー: Issue → OpenSpec(proposal/tasks) → task-start → 実装 → Archive(完了 change・同一 PR) → Review → マージ → doc更新
+  - 原則すべての変更で change を作成する。proposal.md / tasks.md は必須。design.md / delta spec(specs/) は任意。
+  - 完了した change は PR マージ前に、実装と同じ PR 内で openspec archive する（アーカイブ漏れ防止）。複数フェーズの change は全フェーズ完了までアーカイブしなくてよい。
+  - 小さい変更（バグ修正・軽微な文言調整等）であれば、change の作成を例外的にスキップしてよい。
+  - 実装前の認識合わせと、変更時点の意思決定の記録を優先する。
+
+  CLI 操作の優先:
+  - `openspec --help` で CLI に該当コマンドがあればそちらを使う（new / status / validate / archive 等）。
+  - CLI で対応できない場合のみ手動ファイル操作を行う。
+
+rules:
+  proposal:
+    - "Why（なぜ）と What Changes（何を）を先に固める。How は design.md に逃がす。"
+    - "Capability 名は kebab-case。"
+    - "小さい変更で proposal を書くほどでもないなら OpenSpec 自体をスキップしてよい。"
+  specs:
+    - "任意。spec-level の振る舞い/制約が変わるときだけ delta spec を書く。実装詳細は書かない。"
+    - "reviewd の spec-level とは「検知するイベント種別」「rules.yaml / config.yaml のスキーマ」「CLI サブコマンドの契約」「冪等性の保証」を指す。内部リファクタは spec ではない。"
+  design:
+    - "任意。非自明な設計判断・代替案の検討・トレードオフがあるときだけ書く。"
+    - "外部コマンド（gh / claude / git / launchctl）との境界を変える判断は design に残す価値が高い。"
+  tasks:
+    - "proposal の What Changes を実行可能な粒度のチェックリストに落とす。"
+    - "task-start（task.*.md）はローカルの作業ログ。tasks.md は Change の受け入れ条件。役割を混ぜない。"
+    - "実装を伴う change の tasks には `make pre-commit` の通過を必ず含める。"

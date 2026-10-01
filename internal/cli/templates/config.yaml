@@ -1,0 +1,77 @@
+version: 1
+
+paths:
+  # 状態ファイルの置き場所。以下の個別項目は空なら work_dir から導出される。
+  work_dir: ~/.reviewd
+  # db_path: ""
+  # repos_dir: ""
+  # worktrees_dir: ""
+  # runs_dir: ""
+  # logs_dir: ""
+  # lock_path: ""
+
+github:
+  gh_path: gh
+  # 空なら `gh api user` で解決する
+  login: ""
+
+claude:
+  path: claude
+  # 起動時に必ずこのモデルを指定する。"default" は Claude Code の
+  # Default (recommended)。
+  # --model はコマンドラインの指定が settings.json の model や ANTHROPIC_MODEL より
+  # 優先されるため、明示的に渡すことで「周囲の設定に引きずられて意図しないモデルで
+  # 起動する」事故を防げる。空にすると --model を渡さない（周囲の設定に従う）
+  model: default
+  # headless: `claude -p` を子プロセスで実行し、終了を待って result.md を書く
+  # ghostty : Ghostty のタブで対話モードの claude を起動して即座に戻る
+  #           （出力は reviewd には戻らない。読むのは人の仕事）
+  # rules.yaml の action.mode でルール単位に上書きできる
+  mode: headless
+  # 1 実行あたりの上限。ルール側の action.timeout が優先される
+  timeout: 20m
+  # 同時に走らせる claude プロセスの上限
+  max_concurrent: 1
+  # claude -p に必ず付ける引数。
+  #  - stream-json は結果の取り出しに必要なので外さない
+  #  - allowedTools / disallowedTools でレビューを読み取り専用に閉じ込める
+  #  - --permission-mode plan は使わない（レビューではなく「計画」を返してしまうため）
+  extra_args:
+    - --output-format
+    - stream-json
+    - --verbose
+    - --allowedTools
+    - "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(git rev-parse:*)"
+    - --disallowedTools
+    - "Edit,Write,NotebookEdit,Bash(git push:*),Bash(git commit:*),Bash(gh:*)"
+  # mode: ghostty のとき対話 claude に渡す引数。既定は空。
+  # headless の締め付けは `-p` が許可を尋ねられない（未許可ツールは黙って拒否される）
+  # ための措置。対話セッションには人がいて許可プロンプトに答えられるので、
+  # 静的な許可リストより安全かつ柔軟。--disallowedTools は実行時に覆せないため、
+  # ここで Write や gh を塞ぐと「タスクファイルを残す」「PR を読む」プロンプトが壊れる
+  interactive_args: []
+  # 対話セッション（mode: ghostty）を Remote Control 有効で起動する。
+  # セッション名は reviewd-<owner>__<name>-pr<N> が自動で付く。
+  # headless では効かない（`claude -p` に操作対象のセッションが無いため）
+  remote_control: true
+
+# mode: ghostty のときだけ使う
+ghostty:
+  app_path: /Applications/Ghostty.app
+  # front = 最前面の window にタブを足す / new = 毎回新しい window
+  window: front
+  # true にすると新しいタブを前面に出す。既定は false
+  # （作業中にレビューが検知されてもフォーカスを奪わないため）
+  activate: false
+  # claude 終了後もタブを残す。false にすると失敗が一瞬で消える
+  keep_open: true
+
+notify:
+  enabled: true
+  # terminal-notifier があれば優先する（クリックで result.md を開けるため）
+  prefer_terminal_notifier: true
+
+poll:
+  # 1 回の poll で起動を許すジョブ数の上限（暴走時のブレーキ）
+  max_jobs_per_poll: 3
+  lock_timeout: 5s

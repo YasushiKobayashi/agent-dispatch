@@ -1,0 +1,17 @@
+# build artifacts
+/bin/
+/dist/
+# root-level binary only: a bare "reviewd" would also ignore cmd/reviewd/
+/reviewd
+
+# local state
+*.db
+*.db-shm
+*.db-wal
+
+# editor / OS
+.DS_Store
+
+# task-start の作業ログ（個人メモ。commit しない）
+# パターンから外れた名前を付けると commit に紛れ込むので task.*.md を厳守する
+task.*.md

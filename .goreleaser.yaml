@@ -1,0 +1,36 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+# Run by the release job in .github/workflows/ci.yml after it pushes the tag.
+version: 2
+
+# The repo is agent-dispatch; the CLI it ships is reviewd. Pin the project name
+# so the archives stay reviewd_<ver>_<os>_<arch>.tar.gz.
+project_name: reviewd
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: reviewd
+    main: ./cmd/reviewd
+    binary: reviewd
+    # osascript / launchd / lsappinfo: macOS only.
+    goos: [darwin]
+    goarch: [arm64, amd64]
+    # modernc.org/sqlite is pure Go, so this cross-compiles from Linux.
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X github.com/YasushiKobayashi/agent-dispatch/internal/cli.Version={{ .Version }}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
