@@ -30,6 +30,7 @@ import (
 // Source produces the events reviewd reacts to.
 type Source interface {
 	ReviewRequested(ctx context.Context, limit int) ([]model.Event, error)
+	AuthorCommented(ctx context.Context, limit int) ([]model.Event, error)
 }
 
 // App holds the wired dependencies for one command invocation.
@@ -192,13 +193,14 @@ func (a *App) Poll(ctx context.Context, opts PollOptions) (PollReport, error) {
 		defer lock.Release()
 	}
 
-	events, err := a.source.ReviewRequested(ctx, opts.Limit)
+	enabled := a.rules.Enabled()
+
+	events, err := a.detect(ctx, enabled, opts.Limit)
 	if err != nil {
 		return report, err
 	}
 	report.Detected = len(events)
 
-	enabled := a.rules.Enabled()
 	budget := a.cfg.Poll.MaxJobsPerPoll
 
 	var (
@@ -268,6 +270,34 @@ func (a *App) Poll(ctx context.Context, opts PollOptions) (PollReport, error) {
 	return report, nil
 }
 
+// detect gathers the events of every kind. Review requests are always looked
+// up so `poll --dry-run` can explain why one was not picked up. Author comments
+// cost a few gh calls per reviewed pull request, so they are only looked up
+// when some rule listens for them.
+func (a *App) detect(ctx context.Context, rules []config.Rule, limit int) ([]model.Event, error) {
+	events, err := a.source.ReviewRequested(ctx, limit)
+	if err != nil {
+		return nil, err
+	}
+	if !handlesAny(rules, model.KindAuthorCommented) {
+		return events, nil
+	}
+	commented, err := a.source.AuthorCommented(ctx, limit)
+	if err != nil {
+		return nil, err
+	}
+	return append(events, commented...), nil
+}
+
+func handlesAny(rules []config.Rule, k model.Kind) bool {
+	for _, r := range rules {
+		if r.IsEnabled() && r.Handles(k) {
+			return true
+		}
+	}
+	return false
+}
+
 // RunOneOptions selects the pull request `reviewd run` acts on.
 type RunOneOptions struct {
 	Repo     string
@@ -283,21 +313,6 @@ type RunOneOptions struct {
 // review.
 func (a *App) RunOne(ctx context.Context, opts RunOneOptions) (Item, error) {
 	repo, prNumber, ruleName := opts.Repo, opts.PRNumber, opts.Rule
-	events, err := a.source.ReviewRequested(ctx, 0)
-	if err != nil {
-		return Item{}, err
-	}
-
-	var found *model.Event
-	for i := range events {
-		if events[i].Repo == repo && events[i].PRNumber == prNumber {
-			found = &events[i]
-			break
-		}
-	}
-	if found == nil {
-		return Item{}, fmt.Errorf("%s#%d is not currently awaiting your review; nothing to run", repo, prNumber)
-	}
 
 	candidates := a.rules.Enabled()
 	if ruleName != "" {
@@ -312,7 +327,35 @@ func (a *App) RunOne(ctx context.Context, opts RunOneOptions) (Item, error) {
 		}
 	}
 
-	matched, decisions := rule.Match(candidates, *found)
+	events, err := a.detect(ctx, candidates, 0)
+	if err != nil {
+		return Item{}, err
+	}
+
+	// A pull request can show up once per kind, e.g. awaiting a re-review and
+	// carrying a reply from its author. The first event a rule accepts wins.
+	var (
+		found     *model.Event
+		matched   *config.Rule
+		decisions []rule.Decision
+	)
+	for i := range events {
+		if events[i].Repo != repo || events[i].PRNumber != prNumber {
+			continue
+		}
+		if found == nil {
+			found = &events[i]
+		}
+		m, d := rule.Match(candidates, events[i])
+		decisions = append(decisions, d...)
+		if m != nil {
+			found, matched = &events[i], m
+			break
+		}
+	}
+	if found == nil {
+		return Item{}, fmt.Errorf("%s#%d is neither awaiting your review nor carrying a new comment from its author; nothing to run", repo, prNumber)
+	}
 	if matched == nil {
 		return Item{Event: *found, Outcome: OutcomeNoRule, Decisions: decisions},
 			fmt.Errorf("no rule matches %s#%d", repo, prNumber)

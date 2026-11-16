@@ -140,6 +140,38 @@ rules:
 `{{.Repo}}` `{{.PRNumber}}` `{{.PRTitle}}` `{{.PRURL}}` `{{.Author}}`
 `{{.HeadRefName}}` `{{.HeadSHA}}` `{{.BaseRefName}}` `{{.IsDraft}}` `{{.Labels}}`。
 
+#### `author_commented`: PR 作成者のコメントで起動する
+
+`on: [author_commented]` のルールは、**自分がレビューした open PR に、PR の作成者本人が
+自分の最新レビューより後にコメントしたとき**に起動する。「指摘に返信が来たら見直す」用。
+
+- 対象のコメント: 会話欄のコメント・インラインコメント（スレッドへの返信を含む）・空でない review 本文
+- **作成者以外は無視する。** 他のレビュアーや bot（CI の結果コメント等）では起動しない。bot が作成者の PR も対象外
+- **冪等キーは最新の作成者コメントの ID。** 連投しても 1 回だけ走り、その後さらに返信があればもう一度走る
+- 自分がまだレビューしていない PR では起動しない（それは `review_requested` の役目）
+- この種別を `on` に持つ有効なルールが無ければ検索自体を行わない（PR ごとに gh を 2 回呼ぶため）
+
+プロンプトでは `{{.Comments}}`（古い順）が使える。各要素は
+`{{.Author}}` `{{.Body}}` `{{.URL}}` `{{.Path}}` `{{.Line}}`（`Path` / `Line` はインラインのみ）。
+
+```yaml
+- name: author-commented
+  on: [author_commented]
+  match:
+    exclude_authors: ["*[bot]"]
+  action:
+    mode: ghostty
+    prompt: |
+      {{.Repo}}#{{.PRNumber}} の作成者から返信が来た。
+      {{range .Comments}}
+      - {{.URL}}{{if .Path}} (`{{.Path}}:{{.Line}}`){{end}}
+        {{.Body}}
+      {{end}}
+```
+
+> **注意**: コメント本文はそのままプロンプトに入る。作成者が書いた指示に claude が
+> 従ってしまう余地があるので、`headless` の読み取り専用設定（`claude.extra_args`）を外す場合は気をつけること。
+
 #### `action.workdir`: 既存 clone で起動する（MCP 対策）
 
 `action.workdir` を書くと、**reviewd は worktree を用意せず**、そのディレクトリで claude を
@@ -293,9 +325,10 @@ exit code・timeout・プロセスグループ kill・同時実行数を検証�
 
 ## 現状のスコープ
 
-検知しているイベントは `review_requested` のみ。以下は未実装（[doc/design.md](doc/design.md) §12）。
+検知しているイベントは `review_requested` と `author_commented`。以下は未実装（[doc/design.md](doc/design.md) §12）。
 
 - `review_submitted` / 新規 commit / CI 完了 / Renovate 等の更新
+- 作成者以外（他のレビュアー等）のコメントでの起動
 - 結果の PR コメント投稿
 - tmux セッションを立てて対話モードの claude を起動する出力先（Ghostty タブ版は実装済み）
 - Slack 通知

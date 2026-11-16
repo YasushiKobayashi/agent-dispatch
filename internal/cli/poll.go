@@ -18,7 +18,7 @@ func newPollCmd(g *globals) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "poll",
-		Short: "1 回ポーリングして、条件に合うレビュー依頼で Claude Code を起動する",
+		Short: "1 回ポーリングして、条件に合うレビュー依頼・PR 作成者のコメントで Claude Code を起動する",
 		Long: strings.TrimSpace(`
 launchd から定期的に呼ばれる本体。
 
@@ -52,7 +52,7 @@ func newSeedCmd(g *globals) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "seed",
-		Short: "現在のレビュー依頼を実行せず「処理済み」として記録する",
+		Short: "現在検知できるイベントを実行せず「処理済み」として記録する",
 		Long: strings.TrimSpace(`
 導入直後に溜まっているレビュー依頼が一斉に発火するのを防ぎます。
 daemon install の前に 1 回実行してください。
@@ -91,7 +91,7 @@ func newRunCmd(g *globals) *cobra.Command {
 		Short: "指定した PR に対して手動で 1 回実行する",
 		Long: strings.TrimSpace(`
 処理済みかどうかを無視して実行します。失敗した run をやり直すときに使います。
-対象はレビュー依頼中の PR に限られます。
+対象はレビュー依頼中の PR か、自分のレビュー後に作成者がコメントした PR に限られます。
 `),
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -157,7 +157,8 @@ func printPollReport(out interface{ Write([]byte) (int, error) }, report app.Pol
 		return
 	}
 	for _, item := range report.Items {
-		fmt.Fprintf(out, "  %-18s %s#%d", item.Outcome, item.Event.Repo, item.Event.PRNumber)
+		// The same pull request can appear once per kind, so name the kind.
+		fmt.Fprintf(out, "  %-18s %s#%d %s", item.Outcome, item.Event.Repo, item.Event.PRNumber, item.Event.Kind)
 		if item.Rule != "" {
 			fmt.Fprintf(out, " rule=%s", item.Rule)
 		}
