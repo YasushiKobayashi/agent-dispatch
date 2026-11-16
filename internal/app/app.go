@@ -207,6 +207,10 @@ func (a *App) Poll(ctx context.Context, opts PollOptions) (PollReport, error) {
 		mu      sync.Mutex
 		wg      sync.WaitGroup
 		started int
+		// running holds the pull requests already started in this poll. Every
+		// run of a pull request shares one worktree path, and preparing it
+		// clears whatever is there, so two runs at once would wreck each other.
+		running = make(map[string]bool)
 	)
 	appendItem := func(item Item) {
 		mu.Lock()
@@ -233,7 +237,7 @@ func (a *App) Poll(ctx context.Context, opts PollOptions) (PollReport, error) {
 
 		switch {
 		case opts.Seed:
-			if err := a.store.MarkProcessed(ctx, ev); err != nil {
+			if err := a.markProcessed(ctx, ev); err != nil {
 				return report, err
 			}
 			appendItem(Item{Event: ev, Rule: matched.Name, Outcome: OutcomeSeeded})
@@ -243,6 +247,12 @@ func (a *App) Poll(ctx context.Context, opts PollOptions) (PollReport, error) {
 			continue
 		}
 
+		if running[prKey(ev)] {
+			// Left unrecorded, like the budget case, so the next poll runs it.
+			a.log.Info("another event of this pull request is running; deferring", "event", ev.Key())
+			appendItem(Item{Event: ev, Rule: matched.Name, Outcome: OutcomeDeferred})
+			continue
+		}
 		if started >= budget {
 			// Leave it unrecorded so the next poll picks it up.
 			a.log.Info("per-poll job budget reached; deferring",
@@ -251,10 +261,11 @@ func (a *App) Poll(ctx context.Context, opts PollOptions) (PollReport, error) {
 			continue
 		}
 		started++
+		running[prKey(ev)] = true
 
 		// Recorded before the run, not after: a run that keeps failing must not
 		// be retried on every poll.
-		if err := a.store.MarkProcessed(ctx, ev); err != nil {
+		if err := a.markProcessed(ctx, ev); err != nil {
 			return report, err
 		}
 
@@ -282,20 +293,47 @@ func (a *App) detect(ctx context.Context, rules []config.Rule, limit int) ([]mod
 	if !handlesAny(rules, model.KindAuthorCommented) {
 		return events, nil
 	}
+	// One unreadable pull request, or a failed search, must not stop the
+	// review requests from running. Whatever was found is still used.
 	commented, err := a.source.AuthorCommented(ctx, limit)
 	if err != nil {
-		return nil, err
+		a.log.Warn("could not look up every author comment", "err", err)
 	}
 	return append(events, commented...), nil
 }
 
+// handlesAny reports whether any of the rules listens for k. The caller picks
+// the rules: Poll passes the enabled ones, while `reviewd run --rule` may name
+// a disabled one and still deserves an accurate "disabled" verdict.
 func handlesAny(rules []config.Rule, k model.Kind) bool {
 	for _, r := range rules {
-		if r.IsEnabled() && r.Handles(k) {
+		if r.Handles(k) {
 			return true
 		}
 	}
 	return false
+}
+
+// markProcessed records the event. An author comment event also records each
+// comment it carried as a cursor of its own: if the newest one is deleted, the
+// cursor falls back to an older comment that was already handed to Claude, and
+// that must not look new.
+func (a *App) markProcessed(ctx context.Context, ev model.Event) error {
+	if err := a.store.MarkProcessed(ctx, ev); err != nil {
+		return err
+	}
+	for _, c := range ev.Comments {
+		seen := ev
+		seen.Cursor = c.ID
+		if err := a.store.MarkProcessed(ctx, seen); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func prKey(ev model.Event) string {
+	return ev.Repo + "#" + strconv.Itoa(ev.PRNumber)
 }
 
 // RunOneOptions selects the pull request `reviewd run` acts on.
@@ -361,7 +399,7 @@ func (a *App) RunOne(ctx context.Context, opts RunOneOptions) (Item, error) {
 			fmt.Errorf("no rule matches %s#%d", repo, prNumber)
 	}
 
-	if err := a.store.MarkProcessed(ctx, *found); err != nil {
+	if err := a.markProcessed(ctx, *found); err != nil {
 		return Item{}, err
 	}
 
