@@ -30,6 +30,7 @@ import (
 // Source produces the events reviewd reacts to.
 type Source interface {
 	ReviewRequested(ctx context.Context, limit int) ([]model.Event, error)
+	AuthorCommented(ctx context.Context, limit int) ([]model.Event, error)
 }
 
 // App holds the wired dependencies for one command invocation.
@@ -192,19 +193,24 @@ func (a *App) Poll(ctx context.Context, opts PollOptions) (PollReport, error) {
 		defer lock.Release()
 	}
 
-	events, err := a.source.ReviewRequested(ctx, opts.Limit)
+	enabled := a.rules.Enabled()
+
+	events, err := a.detect(ctx, enabled, opts.Limit)
 	if err != nil {
 		return report, err
 	}
 	report.Detected = len(events)
 
-	enabled := a.rules.Enabled()
 	budget := a.cfg.Poll.MaxJobsPerPoll
 
 	var (
 		mu      sync.Mutex
 		wg      sync.WaitGroup
 		started int
+		// running holds the pull requests already started in this poll. Every
+		// run of a pull request shares one worktree path, and preparing it
+		// clears whatever is there, so two runs at once would wreck each other.
+		running = make(map[string]bool)
 	)
 	appendItem := func(item Item) {
 		mu.Lock()
@@ -231,7 +237,7 @@ func (a *App) Poll(ctx context.Context, opts PollOptions) (PollReport, error) {
 
 		switch {
 		case opts.Seed:
-			if err := a.store.MarkProcessed(ctx, ev); err != nil {
+			if err := a.markProcessed(ctx, ev); err != nil {
 				return report, err
 			}
 			appendItem(Item{Event: ev, Rule: matched.Name, Outcome: OutcomeSeeded})
@@ -241,6 +247,12 @@ func (a *App) Poll(ctx context.Context, opts PollOptions) (PollReport, error) {
 			continue
 		}
 
+		if running[prKey(ev)] {
+			// Left unrecorded, like the budget case, so the next poll runs it.
+			a.log.Info("another event of this pull request is running; deferring", "event", ev.Key())
+			appendItem(Item{Event: ev, Rule: matched.Name, Outcome: OutcomeDeferred})
+			continue
+		}
 		if started >= budget {
 			// Leave it unrecorded so the next poll picks it up.
 			a.log.Info("per-poll job budget reached; deferring",
@@ -249,10 +261,11 @@ func (a *App) Poll(ctx context.Context, opts PollOptions) (PollReport, error) {
 			continue
 		}
 		started++
+		running[prKey(ev)] = true
 
 		// Recorded before the run, not after: a run that keeps failing must not
 		// be retried on every poll.
-		if err := a.store.MarkProcessed(ctx, ev); err != nil {
+		if err := a.markProcessed(ctx, ev); err != nil {
 			return report, err
 		}
 
@@ -266,6 +279,61 @@ func (a *App) Poll(ctx context.Context, opts PollOptions) (PollReport, error) {
 	wg.Wait()
 
 	return report, nil
+}
+
+// detect gathers the events of every kind. Review requests are always looked
+// up so `poll --dry-run` can explain why one was not picked up. Author comments
+// cost a few gh calls per reviewed pull request, so they are only looked up
+// when some rule listens for them.
+func (a *App) detect(ctx context.Context, rules []config.Rule, limit int) ([]model.Event, error) {
+	events, err := a.source.ReviewRequested(ctx, limit)
+	if err != nil {
+		return nil, err
+	}
+	if !handlesAny(rules, model.KindAuthorCommented) {
+		return events, nil
+	}
+	// One unreadable pull request, or a failed search, must not stop the
+	// review requests from running. Whatever was found is still used.
+	commented, err := a.source.AuthorCommented(ctx, limit)
+	if err != nil {
+		a.log.Warn("could not look up every author comment", "err", err)
+	}
+	return append(events, commented...), nil
+}
+
+// handlesAny reports whether any of the rules listens for k. The caller picks
+// the rules: Poll passes the enabled ones, while `reviewd run --rule` may name
+// a disabled one and still deserves an accurate "disabled" verdict.
+func handlesAny(rules []config.Rule, k model.Kind) bool {
+	for _, r := range rules {
+		if r.Handles(k) {
+			return true
+		}
+	}
+	return false
+}
+
+// markProcessed records the event. An author comment event also records each
+// comment it carried as a cursor of its own: if the newest one is deleted, the
+// cursor falls back to an older comment that was already handed to Claude, and
+// that must not look new.
+func (a *App) markProcessed(ctx context.Context, ev model.Event) error {
+	if err := a.store.MarkProcessed(ctx, ev); err != nil {
+		return err
+	}
+	for _, c := range ev.Comments {
+		seen := ev
+		seen.Cursor = c.ID
+		if err := a.store.MarkProcessed(ctx, seen); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func prKey(ev model.Event) string {
+	return ev.Repo + "#" + strconv.Itoa(ev.PRNumber)
 }
 
 // RunOneOptions selects the pull request `reviewd run` acts on.
@@ -283,21 +351,6 @@ type RunOneOptions struct {
 // review.
 func (a *App) RunOne(ctx context.Context, opts RunOneOptions) (Item, error) {
 	repo, prNumber, ruleName := opts.Repo, opts.PRNumber, opts.Rule
-	events, err := a.source.ReviewRequested(ctx, 0)
-	if err != nil {
-		return Item{}, err
-	}
-
-	var found *model.Event
-	for i := range events {
-		if events[i].Repo == repo && events[i].PRNumber == prNumber {
-			found = &events[i]
-			break
-		}
-	}
-	if found == nil {
-		return Item{}, fmt.Errorf("%s#%d is not currently awaiting your review; nothing to run", repo, prNumber)
-	}
 
 	candidates := a.rules.Enabled()
 	if ruleName != "" {
@@ -312,13 +365,41 @@ func (a *App) RunOne(ctx context.Context, opts RunOneOptions) (Item, error) {
 		}
 	}
 
-	matched, decisions := rule.Match(candidates, *found)
+	events, err := a.detect(ctx, candidates, 0)
+	if err != nil {
+		return Item{}, err
+	}
+
+	// A pull request can show up once per kind, e.g. awaiting a re-review and
+	// carrying a reply from its author. The first event a rule accepts wins.
+	var (
+		found     *model.Event
+		matched   *config.Rule
+		decisions []rule.Decision
+	)
+	for i := range events {
+		if events[i].Repo != repo || events[i].PRNumber != prNumber {
+			continue
+		}
+		if found == nil {
+			found = &events[i]
+		}
+		m, d := rule.Match(candidates, events[i])
+		decisions = append(decisions, d...)
+		if m != nil {
+			found, matched = &events[i], m
+			break
+		}
+	}
+	if found == nil {
+		return Item{}, fmt.Errorf("%s#%d is neither awaiting your review nor carrying a new comment from its author; nothing to run", repo, prNumber)
+	}
 	if matched == nil {
 		return Item{Event: *found, Outcome: OutcomeNoRule, Decisions: decisions},
 			fmt.Errorf("no rule matches %s#%d", repo, prNumber)
 	}
 
-	if err := a.store.MarkProcessed(ctx, *found); err != nil {
+	if err := a.markProcessed(ctx, *found); err != nil {
 		return Item{}, err
 	}
 

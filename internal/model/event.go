@@ -13,12 +13,15 @@ const (
 	// KindReviewRequested fires when a review has been requested from the
 	// configured GitHub user on an open pull request.
 	KindReviewRequested Kind = "review_requested"
+	// KindAuthorCommented fires when the author of a pull request the
+	// configured user has reviewed comments on it after that review.
+	KindAuthorCommented Kind = "author_commented"
 )
 
 // AllKinds lists every kind reviewd can currently detect. Rules are validated
 // against it so a typo in rules.yaml fails at load time rather than silently
 // never matching.
-var AllKinds = []Kind{KindReviewRequested}
+var AllKinds = []Kind{KindReviewRequested, KindAuthorCommented}
 
 // Valid reports whether k is a kind reviewd knows how to detect.
 func (k Kind) Valid() bool {
@@ -53,8 +56,24 @@ type Event struct {
 	IsDraft     bool
 	Labels      []string
 
+	// Comments holds the author's comments that triggered a
+	// KindAuthorCommented event, oldest first. Empty for other kinds.
+	Comments []Comment
+
 	Cursor     string
 	DetectedAt time.Time
+}
+
+// Comment is one pull request comment. Path and Line are set only for inline
+// review comments.
+type Comment struct {
+	ID        string
+	Author    string
+	Body      string
+	URL       string
+	Path      string
+	Line      int
+	CreatedAt time.Time
 }
 
 // Key is a human readable identifier for the event, used in logs and lock names.

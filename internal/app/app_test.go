@@ -24,14 +24,23 @@ import (
 // --- fakes -----------------------------------------------------------------
 
 type fakeSource struct {
-	events []model.Event
-	err    error
-	calls  int
+	events    []model.Event
+	commented []model.Event
+	err       error
+	calls     int
+	// commentCalls counts AuthorCommented lookups, which should only happen
+	// when a rule listens for them.
+	commentCalls int
 }
 
 func (f *fakeSource) ReviewRequested(context.Context, int) ([]model.Event, error) {
 	f.calls++
 	return f.events, f.err
+}
+
+func (f *fakeSource) AuthorCommented(context.Context, int) ([]model.Event, error) {
+	f.commentCalls++
+	return f.commented, f.err
 }
 
 // gitStub stands in for gh and git. `worktree add` creates the directory so the
@@ -886,4 +895,187 @@ rules:
       workdir: ` + dir + `
       timeout: 20s
 `
+}
+
+const commentRule = `
+version: 1
+rules:
+  - name: review-requested
+    on: [review_requested]
+    action:
+      prompt: "review {{.Repo}}#{{.PRNumber}}"
+  - name: author-commented
+    on: [author_commented]
+    action:
+      prompt: "{{range .Comments}}{{.Author}}: {{.Body}}\n{{end}}"
+      mode: ghostty
+`
+
+func commentEvent(pr int, cursor string) model.Event {
+	ev := event(pr, "octocat")
+	ev.Kind = model.KindAuthorCommented
+	ev.Cursor = cursor
+	ev.Comments = []model.Comment{
+		{ID: "c1", Author: "octocat", Body: "fixed"},
+		{ID: cursor, Author: "octocat", Body: "please look again"},
+	}
+	return ev
+}
+
+func TestAuthorCommentsAreNotLookedUpWithoutARule(t *testing.T) {
+	h := newHarness(t, reviewRule, nil, 3)
+	h.source.commented = []model.Event{commentEvent(42, "c2")}
+
+	report, err := h.app.Poll(context.Background(), PollOptions{DryRun: true})
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if h.source.commentCalls != 0 {
+		t.Errorf("AuthorCommented called %d times, want 0 when no rule listens for it", h.source.commentCalls)
+	}
+	if report.Detected != 0 {
+		t.Errorf("detected = %d, want 0", report.Detected)
+	}
+}
+
+func TestPollRunsAuthorCommentWithTheCommentsInThePrompt(t *testing.T) {
+	h := newHarness(t, commentRule, nil, 3)
+	h.source.commented = []model.Event{commentEvent(42, "c2")}
+	ctx := context.Background()
+
+	report, err := h.app.Poll(ctx, PollOptions{})
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if got := outcomes(report)[OutcomeRan]; got != 1 {
+		t.Fatalf("ran = %d, want 1 (report: %+v)", got, report.Items)
+	}
+	if item := report.Items[0]; item.Rule != "author-commented" || item.Status != model.RunLaunched {
+		t.Fatalf("item = %+v, want author-commented launched", item)
+	}
+
+	prompt, err := os.ReadFile(filepath.Join(h.app.runner.OutputDir(h.source.commented[0]), "prompt.md"))
+	if err != nil {
+		t.Fatalf("read prompt.md: %v", err)
+	}
+	if want := "octocat: fixed\noctocat: please look again"; !strings.Contains(string(prompt), want) {
+		t.Errorf("prompt = %q, want it to contain %q", prompt, want)
+	}
+
+	// The same newest comment does not fire twice; a newer one does.
+	report, err = h.app.Poll(ctx, PollOptions{})
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if got := outcomes(report)[OutcomeProcessed]; got != 1 {
+		t.Errorf("second poll: processed = %d, want 1 (report: %+v)", got, report.Items)
+	}
+	h.source.commented = []model.Event{commentEvent(42, "c3")}
+	report, err = h.app.Poll(ctx, PollOptions{})
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if got := outcomes(report)[OutcomeRan]; got != 1 {
+		t.Errorf("after a new comment: ran = %d, want 1 (report: %+v)", got, report.Items)
+	}
+}
+
+func TestRunOnePicksTheEventARuleAccepts(t *testing.T) {
+	h := newHarness(t, commentRule, nil, 3)
+	h.source.commented = []model.Event{commentEvent(42, "c2")}
+
+	item, err := h.app.RunOne(context.Background(), RunOneOptions{Repo: "acme/widgets", PRNumber: 42})
+	if err != nil {
+		t.Fatalf("RunOne: %v", err)
+	}
+	if item.Rule != "author-commented" || item.Event.Kind != model.KindAuthorCommented {
+		t.Errorf("item = %+v, want the author-commented rule on the comment event", item)
+	}
+}
+
+func TestPollRunsOnlyOneEventPerPullRequest(t *testing.T) {
+	h := newHarness(t, commentRule, []model.Event{event(42, "octocat")}, 3)
+	h.source.commented = []model.Event{commentEvent(42, "c2")}
+	ctx := context.Background()
+
+	report, err := h.app.Poll(ctx, PollOptions{})
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if c := outcomes(report); c[OutcomeRan] != 1 || c[OutcomeDeferred] != 1 {
+		t.Fatalf("outcomes = %v, want 1 ran + 1 deferred: both share the PR's worktree", c)
+	}
+
+	// The deferred event was left unrecorded, so the next poll runs it.
+	report, err = h.app.Poll(ctx, PollOptions{})
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if c := outcomes(report); c[OutcomeRan] != 1 || c[OutcomeProcessed] != 1 {
+		t.Errorf("second poll outcomes = %v, want 1 ran + 1 already-processed", c)
+	}
+}
+
+func TestDeletingTheNewestCommentDoesNotRefire(t *testing.T) {
+	h := newHarness(t, commentRule, nil, 3)
+	h.source.commented = []model.Event{commentEvent(42, "c2")}
+	ctx := context.Background()
+
+	if _, err := h.app.Poll(ctx, PollOptions{}); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+
+	// c2 was deleted: the newest remaining comment is c1, already handed over.
+	ev := commentEvent(42, "c1")
+	ev.Comments = ev.Comments[:1]
+	h.source.commented = []model.Event{ev}
+
+	report, err := h.app.Poll(ctx, PollOptions{})
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if c := outcomes(report); c[OutcomeProcessed] != 1 {
+		t.Errorf("outcomes = %v, want the fallback cursor to count as processed", c)
+	}
+}
+
+func TestAuthorCommentFailureDoesNotStopReviewRequests(t *testing.T) {
+	h := newHarness(t, commentRule, []model.Event{event(42, "octocat")}, 3)
+	h.app.source = &splitSource{reviews: []model.Event{event(42, "octocat")}, commentErr: errors.New("gh: 404")}
+
+	report, err := h.app.Poll(context.Background(), PollOptions{DryRun: true})
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if c := outcomes(report); c[OutcomeDryRun] != 1 {
+		t.Errorf("outcomes = %v, want the review request to still be picked up", c)
+	}
+}
+
+func TestRunOneExplainsADisabledCommentRule(t *testing.T) {
+	body := strings.Replace(commentRule, "  - name: author-commented\n", "  - name: author-commented\n    enabled: false\n", 1)
+	h := newHarness(t, body, nil, 3)
+	h.source.commented = []model.Event{commentEvent(42, "c2")}
+
+	item, err := h.app.RunOne(context.Background(), RunOneOptions{Repo: "acme/widgets", PRNumber: 42, Rule: "author-commented"})
+	if err == nil || !strings.Contains(err.Error(), "no rule matches") {
+		t.Fatalf("err = %v, want a no-rule-matches error rather than 'no new comment'", err)
+	}
+	if len(item.Decisions) == 0 || item.Decisions[0].Reason != "disabled" {
+		t.Errorf("decisions = %+v, want the rule reported as disabled", item.Decisions)
+	}
+}
+
+// splitSource fails only the author comment lookup.
+type splitSource struct {
+	reviews    []model.Event
+	commentErr error
+}
+
+func (s *splitSource) ReviewRequested(context.Context, int) ([]model.Event, error) {
+	return s.reviews, nil
+}
+
+func (s *splitSource) AuthorCommented(context.Context, int) ([]model.Event, error) {
+	return nil, s.commentErr
 }

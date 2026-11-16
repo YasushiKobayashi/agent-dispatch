@@ -179,6 +179,7 @@ type Kind string
 
 const (
     KindReviewRequested Kind = "review_requested"
+    KindAuthorCommented Kind = "author_commented" // §5-2
     // Phase 2: review_submitted / new_commit / check_completed / dependency_update
 )
 
@@ -196,6 +197,9 @@ type Event struct {
     BaseRefName string
     IsDraft     bool
     Labels      []string
+
+    // author_commented のみ。作成者のコメント（古い順）。§5-2
+    Comments []Comment
 
     // 冪等キーの値。§6 参照
     Cursor     string
@@ -219,13 +223,60 @@ gh pr view <N> --repo <owner>/<name> --json headRefName,headRefOid,baseRefName,i
 呼び出し回数は「レビュー依頼中の open PR 数」に比例する。通常は数件なので許容。
 ヒット 0 件のときは追加呼び出しゼロ。
 
+### 5-2. author_commented の取得
+
+「自分がレビューした PR に、作成者が返信した」を検知する。
+
+```sh
+gh search prs --reviewed-by=<login> --state=open --sort updated --json \
+  number,title,url,repository,author,isDraft,labels --limit 50
+# ヒットごとに
+gh pr view <N> --repo <owner>/<name> --json headRefName,headRefOid,baseRefName,comments
+gh api repos/<owner>/<name>/pulls/<N>/reviews  --paginate --jq '.[]'
+gh api repos/<owner>/<name>/pulls/<N>/comments --paginate --jq '.[]'
+```
+
+- 検索は `--review-requested` ではなく `--reviewed-by`。レビューを出すと review request は外れるため。
+  `--sort updated` で返信の付いた PR が `--limit` で切られないようにする
+- review は REST から取る。インラインコメントが所属 review を REST の数値 ID（`pull_request_review_id`）で指すため
+- 作成者が bot（`is_bot` / `type: Bot` / `[bot]` 接尾辞）の PR と、自分が作成者の PR は追加取得せず捨てる
+- **自分が最後に発言した時刻より後**に書かれた、**PR 作成者本人の**コメントだけを拾う。
+  「発言」は submitted review と自分のコメント（会話欄・インライン）。手で返答済みの返信では起動しない。
+  submitted review が 1 つも無ければ何も拾わない
+  対象は会話欄コメント・インラインコメント・空でない review 本文。他のレビュアーや bot のコメントは無視する
+  - 「レビュー後」に絞るのは、レビュー依頼前からある古いコメントで一斉発火させないため。
+    まだレビューしていない PR は `review_requested` の担当
+  - スレッドへの返信は本文が空の review も作る。本文はインライン側で拾えるので、review は本文が空でないものだけ採る
+  - PENDING の review は自分だけに見える下書きなので「最新レビュー」に数えない
+  - インラインコメントの時刻は `created_at` ではなく **所属 review の提出時刻**（遅い方）。
+    下書き中のコメントの `created_at` は下書きを書いた時刻で、公開されるのは review 提出時のため
+  - outdated になったインラインコメントは `line` が null になるので `original_line` を使う
+- 1 PR の取得に失敗しても他の PR は続ける。失敗はまとめて warn ログに出し、`review_requested` の処理も止めない
+- `--paginate` 単体はページごとの JSON 配列をそのまま連結出力する（全体として不正な JSON）。
+  `--jq '.[]'` で 1 行 1 オブジェクトにして読む
+- 1 PR につき 1 イベント。`Cursor` は最新の作成者コメントの ID（§6）
+
+1 PR あたり gh を 2 回追加で呼ぶので、この種別を `on` に持つ有効なルールが無ければ検索自体を行わない。
+
+コメント本文はそのままプロンプトに入る（作成者による prompt injection の余地がある）。
+作成者以外を拾わないのはノイズ削減と同時に、この影響範囲を PR 作成者に限るためでもある。
+
 ## 6. 冪等性
 
-`Cursor` の値は **head SHA** を使う。
+`review_requested` の `Cursor` の値は **head SHA** を使う。
 
 - 同じ PR に対してレビュー依頼が出ている間、**新しい commit が積まれるたびに 1 回だけ** 走る
 - 単なる `poll` の繰り返しでは再実行されない
 - PR node id 固定にすると「修正 push 後にもう一度見たい」が拾えないため採用しなかった
+
+`author_commented` の `Cursor` は **最新の作成者コメントの ID**。連投しても 1 回だけ走り、
+その後さらに返信があればもう一度走る。処理済みにするときは、プロンプトに含めた
+**全コメントの ID も** cursor として記録する。最新コメントが削除されると cursor が
+1 つ前のコメントに戻るが、それを新着と誤認して再実行しないため。
+
+1 回の poll では **同じ PR のイベントは 1 件だけ**実行する（review_requested と author_commented が
+同時に出た場合など）。worktree のパスは PR 単位で共通で、準備時に既存のものを消すため、
+並行に走ると互いを壊す。残りは記録せず `deferred` にして次の poll で拾う。
 
 ノイズが問題になった場合は rules.yaml に `min_interval` を足して抑制する（Phase 2）。
 
@@ -440,6 +491,7 @@ terminal-notifier -title "reviewd" -subtitle "<repo>#<pr>" -message "<summary>" 
 ## 12. Phase 2 以降
 
 - イベント種別の拡張: `review_submitted` / `new_commit` / `check_completed` / Renovate 等の更新
+  （`author_commented` は §5-2 で実装済み。作成者以外のコメントでの起動は意図的に持たない）
 - 結果の PR コメント投稿（投稿前確認フロー付き）
 - tmux セッションを立てて対話モードの claude を起動する出力先
   （Ghostty タブ版は §8-2 で実装済み。tmux 版は出力を `capture-pane` で回収できる点が違う）

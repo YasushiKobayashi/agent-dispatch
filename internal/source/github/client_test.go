@@ -182,3 +182,189 @@ func TestResolveLoginCachesResult(t *testing.T) {
 		t.Errorf("called gh %d times, want 1 (result should be cached)", len(runner.calls))
 	}
 }
+
+const reviewedJSON = `[
+  {
+    "author": {"login": "octocat", "is_bot": false, "type": "User"},
+    "isDraft": false,
+    "labels": [{"name": "backend"}],
+    "number": 42,
+    "repository": {"name": "widgets", "nameWithOwner": "acme/widgets"},
+    "title": "feat: something",
+    "url": "https://github.com/acme/widgets/pull/42"
+  },
+  {
+    "author": {"login": "app/renovate", "is_bot": true, "type": "Bot"},
+    "isDraft": false,
+    "labels": [],
+    "number": 43,
+    "repository": {"name": "widgets", "nameWithOwner": "acme/widgets"},
+    "title": "chore(deps): update",
+    "url": "https://github.com/acme/widgets/pull/43"
+  },
+  {
+    "author": {"login": "me", "is_bot": false, "type": "User"},
+    "isDraft": false,
+    "labels": [],
+    "number": 44,
+    "repository": {"name": "widgets", "nameWithOwner": "acme/widgets"},
+    "title": "feat: mine",
+    "url": "https://github.com/acme/widgets/pull/44"
+  }
+]`
+
+// pr42 has a review from "me" at 10:00. The author answered after it in the
+// conversation, in a review body and inline; everything else is either before
+// the review or from someone other than the author.
+const conversation42 = `{
+  "headRefName": "feat/perm", "headRefOid": "aaaa1111", "baseRefName": "main",
+  "comments": [
+    {"id": "IC_old", "author": {"login": "octocat"}, "body": "before review", "url": "u0", "createdAt": "2026-11-01T09:00:00Z"},
+    {"id": "IC_new", "author": {"login": "octocat"}, "body": "fixed, please look again", "url": "u1", "createdAt": "2026-11-01T11:00:00Z"},
+    {"id": "IC_other", "author": {"login": "someone"}, "body": "drive-by", "url": "u2", "createdAt": "2026-11-01T11:30:00Z"},
+    {"id": "IC_bot", "author": {"login": "github-actions"}, "body": "CI passed", "url": "u3", "createdAt": "2026-11-01T11:40:00Z"}
+  ]
+}`
+
+const reviews42 = `{"id": 100, "user": {"login": "me"}, "body": "please fix", "state": "CHANGES_REQUESTED", "html_url": "r100", "submitted_at": "2026-11-01T10:00:00Z"}
+{"id": 101, "user": {"login": "me"}, "body": "", "state": "PENDING", "html_url": "r101", "submitted_at": null}
+{"id": 102, "user": {"login": "octocat"}, "body": "", "state": "COMMENTED", "html_url": "r102", "submitted_at": "2026-11-01T12:00:00Z"}
+{"id": 103, "user": {"login": "octocat"}, "body": "summary of changes", "state": "COMMENTED", "html_url": "r103", "submitted_at": "2026-11-01T12:30:00Z"}
+`
+
+const inline42 = `{"id": 7, "pull_request_review_id": 102, "user": {"login": "octocat"}, "body": "done", "html_url": "u7", "path": "a.go", "line": 12, "original_line": 12, "created_at": "2026-11-01T12:00:00Z"}
+{"id": 5, "pull_request_review_id": 100, "user": {"login": "me"}, "body": "nit", "html_url": "u5", "path": "a.go", "line": 12, "original_line": 12, "created_at": "2026-11-01T10:00:00Z"}
+`
+
+func pr42(conv, reviews, inline string) *fakeRunner {
+	return &fakeRunner{responses: map[string]string{
+		"search prs":        reviewedJSON,
+		"pr view 42":        conv,
+		"pulls/42/reviews":  reviews,
+		"pulls/42/comments": inline,
+	}}
+}
+
+func commentIDs(ev model.Event) string {
+	var ids []string
+	for _, c := range ev.Comments {
+		ids = append(ids, c.ID)
+	}
+	return strings.Join(ids, ",")
+}
+
+func TestAuthorCommented(t *testing.T) {
+	runner := pr42(conversation42, reviews42, inline42)
+
+	events, err := NewWithRunner("gh", "me", runner).AuthorCommented(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("AuthorCommented: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1 (bot PR and own PR are skipped)", len(events))
+	}
+
+	ev := events[0]
+	if ev.Kind != model.KindAuthorCommented || ev.Repo != "acme/widgets" || ev.PRNumber != 42 ||
+		ev.Author != "octocat" || ev.HeadSHA != "aaaa1111" || ev.BaseRefName != "main" {
+		t.Errorf("event = %+v", ev)
+	}
+	if got, want := commentIDs(ev), "IC_new,7,103"; got != want {
+		t.Errorf("comments = %s, want %s (author only, after my review, oldest first)", got, want)
+	}
+	if ev.Cursor != "103" {
+		t.Errorf("cursor = %q, want the newest comment's ID", ev.Cursor)
+	}
+	if c := ev.Comments[1]; c.Path != "a.go" || c.Line != 12 || c.URL != "u7" {
+		t.Errorf("inline comment = %+v, want path/line/url carried over", c)
+	}
+	if c := ev.Comments[2]; c.URL != "r103" {
+		t.Errorf("review comment URL = %q, want r103", c.URL)
+	}
+
+	search := strings.Join(runner.calls[0], " ")
+	if !strings.Contains(search, "--reviewed-by=me") || !strings.Contains(search, "--sort updated") {
+		t.Errorf("search args = %v, want --reviewed-by=me sorted by update", runner.calls[0])
+	}
+	for _, call := range runner.calls {
+		joined := strings.Join(call, " ")
+		if strings.Contains(joined, "43") || strings.Contains(joined, "44") {
+			t.Errorf("looked up a skipped PR: %s", joined)
+		}
+	}
+}
+
+func TestAuthorCommentedIgnoresPRsWithoutNewAuthorComments(t *testing.T) {
+	runner := pr42(`{"headRefName":"f","headRefOid":"aaaa1111","baseRefName":"main",
+	  "comments":[{"id":"IC_old","author":{"login":"octocat"},"body":"x","createdAt":"2026-11-01T09:00:00Z"}]}`,
+		`{"id":100,"user":{"login":"me"},"state":"APPROVED","submitted_at":"2026-11-01T10:00:00Z"}`, "")
+
+	events, err := NewWithRunner("gh", "me", runner).AuthorCommented(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("AuthorCommented: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("got %d events, want 0: the only author comment predates my review", len(events))
+	}
+}
+
+func TestAuthorCommentedSkipsRepliesIAlreadyAnswered(t *testing.T) {
+	runner := pr42(`{"headRefName":"f","headRefOid":"aaaa1111","baseRefName":"main",
+	  "comments":[
+	    {"id":"IC_a","author":{"login":"octocat"},"body":"fixed","createdAt":"2026-11-01T11:00:00Z"},
+	    {"id":"IC_me","author":{"login":"me"},"body":"thanks","createdAt":"2026-11-01T11:30:00Z"}]}`,
+		`{"id":100,"user":{"login":"me"},"state":"COMMENTED","submitted_at":"2026-11-01T10:00:00Z"}`, "")
+
+	events, err := NewWithRunner("gh", "me", runner).AuthorCommented(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("AuthorCommented: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("got %d events, want 0: I answered the author's comment in the conversation", len(events))
+	}
+}
+
+func TestAuthorCommentedDatesInlineRepliesByTheirReview(t *testing.T) {
+	// The author drafted the reply at 09:00, I reviewed at 10:00, and the
+	// author's review carrying the reply was submitted at 11:00.
+	runner := pr42(`{"headRefName":"f","headRefOid":"aaaa1111","baseRefName":"main","comments":[]}`,
+		`{"id":100,"user":{"login":"me"},"state":"COMMENTED","submitted_at":"2026-11-01T10:00:00Z"}
+{"id":200,"user":{"login":"octocat"},"body":"","state":"COMMENTED","submitted_at":"2026-11-01T11:00:00Z"}`,
+		`{"id":9,"pull_request_review_id":200,"user":{"login":"octocat"},"body":"done","path":"a.go","line":null,"original_line":7,"created_at":"2026-11-01T09:00:00Z"}`)
+
+	events, err := NewWithRunner("gh", "me", runner).AuthorCommented(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("AuthorCommented: %v", err)
+	}
+	if len(events) != 1 || commentIDs(events[0]) != "9" {
+		t.Fatalf("events = %+v, want the reply published after my review", events)
+	}
+	if c := events[0].Comments[0]; c.Line != 7 {
+		t.Errorf("line = %d, want original_line 7 for an outdated comment", c.Line)
+	}
+}
+
+func TestAuthorCommentedKeepsGoingPastAnUnreadablePR(t *testing.T) {
+	hits := `[
+	  {"author":{"login":"octocat"},"number":41,"repository":{"name":"gone","nameWithOwner":"acme/gone"}},
+	  {"author":{"login":"octocat"},"number":42,"repository":{"name":"widgets","nameWithOwner":"acme/widgets"}}
+	]`
+	runner := pr42(conversation42, reviews42, inline42)
+	runner.responses["search prs"] = hits
+
+	events, err := NewWithRunner("gh", "me", runner).AuthorCommented(context.Background(), 0)
+	if err == nil || !strings.Contains(err.Error(), "acme/gone#41") {
+		t.Errorf("err = %v, want it to name the unreadable PR", err)
+	}
+	if len(events) != 1 || events[0].PRNumber != 42 {
+		t.Errorf("events = %+v, want PR 42 despite PR 41 failing", events)
+	}
+}
+
+func TestAuthorCommentedPropagatesGhFailure(t *testing.T) {
+	runner := &fakeRunner{err: errors.New("gh: authentication required")}
+
+	if _, err := NewWithRunner("gh", "me", runner).AuthorCommented(context.Background(), 0); err == nil {
+		t.Fatal("AuthorCommented succeeded despite a gh failure")
+	}
+}
